@@ -43,24 +43,31 @@ k_start_srrc = 2*K*n+1;
 bit_stream = bitStreamConvert(arr_3d, size(arr_3d, 3));
 num_bits = length(bit_stream);
 
+% --- System Parameters ---
+sigma = 0; % Start with very low noise to verify logic
+Eb = 1;
+
+% --- Find k_start (Synchronization) ---
+% Send a single pulse through the system to find the delay
+test_bit = 1;
+test_mod = signal_mod(test_bit, n, half_sine);
+test_chan = transmit_channel(h, n, test_mod, 0); % No noise for calibration
+test_mf = matched_filter(test_chan, half_sine);
+test_eq = qz(test_mf, h, n); % Use ZF for calibration
+
+[~, k_start] = max(test_eq); % The peak is our perfect sampling point!
+
+% --- Actual Image Transmission ---
 mod_sig = signal_mod(bit_stream, n, half_sine);
+channel_out = transmit_channel(h, n, mod_sig, sigma);
 
-channel_out = transmit_channel(h, n, mod_sig, 0);
-
-% --- Receiver: matched filter + equalizer ---
+% --- Receiver ---
 mf_out = matched_filter(channel_out, half_sine);
-eq_out = qz(mf_out, h);   % or call mmse(...) instead
+eq_out = qz(mf_out, h, n); % For ZF Equalizer
 
-% --- Sample and detect ---
-% k_start: pulse delay + matched filter delay + channel/equalizer delay
-% For half-sine + ZF (filter-based): k_start = length(half_sine) = 32
-% but you need to verify empirically and add equalizer delay
-k_start = length(half_sine);   % adjust based on your delay analysis
+% --- Detect and Reconstruct ---
 detected_bits = detect_bits(eq_out, k_start, n, num_bits);
-
-% --- Reconstruct image ---
 image_recovered = convert_to_image(detected_bits, image_max, image_min, image_size);
-
 
 figure()
 imshow(image_recovered)
@@ -422,17 +429,30 @@ function sent_image = convert_to_image(detected_bits, image_max, image_min, imag
     
     num_blocks = num_pixels / 64;
     dct_blocks_3d = reshape(dct_vals, [8 8 num_blocks]);
-    dct_image = reshape(dct_blocks_3d, [m n]);
+    % dct_image = reshape(dct_blocks_3d, [m n]);
+    B = reshape(dct_blocks_3d, [8, 8, m/8, n/8]);
+    B = permute(B, [1, 3, 2, 4]);
+    dct_image = reshape(B, [m, n]);
     
     fun = @(block_struct) idct2(block_struct.data);
     sent_image = blockproc(dct_image, [8 8], fun);
 end
 
 function detected_bits = detect_bits(eq_out, k_start, n, num_bits)
+    % Sample exactly at the peak of each bit period
     sample_indices = k_start : n : k_start + (num_bits - 1)*n;
+    
+    % Boundary check to avoid indexing errors
+    sample_indices = sample_indices(sample_indices <= length(eq_out));
     samples = eq_out(sample_indices);
     
+    % Threshold detection: > 0 is bit 1, <= 0 is bit 0[cite: 1]
     detected_bits = double(samples > 0);
+    
+    % Pad with zeros if sampling missed any bits due to truncation
+    if length(detected_bits) < num_bits
+        detected_bits(end+1 : num_bits) = 0;
+    end
 end
 
 function channel_out = transmit_channel(h, n, signal_in, sigma)
@@ -451,26 +471,21 @@ function mf_out = matched_filter(channel_out, pulse_shape)
     mf_out = conv(channel_out, mf);
 end
 
-function qz_out = qz(mf_out, h)
-
-    q_zf = filter(1, h, [1, zeros(1, 10000)]);
-    
-    qz_out = conv(mf_out, q_zf);
-
+function qz_out = qz(mf_out, h, n)
+    h_upsample = upsample(h, n); % Match the channel tap spacing
+    qz_out = filter(1, h_upsample, mf_out); 
 end
 
-function mmse_out = mmse(mf_out, n)
-
-    [H, w] = freqz(h_upsample, 1, n, 'whole');
+function mmse_out = mmse(mf_out, h_upsample, sigma, Eb, n)
+    % Frequency domain implementation of MMSE
+    N = length(mf_out);
+    H = fft(h_upsample, N); 
     
-    Eb = 1;
-    Q_mmse =  conj(H)./((abs(H).^2) + (sigma.^2) / Eb);
+    % Equation: Q_mmse(f) = H*(f) / (|H(f)|^2 + sigma^2/Eb)
+    Q_mmse = conj(H) ./ (abs(H).^2 + (sigma^2 / Eb));
     
-    q_mmse = ifft(Q_mmse);
-
-    mmse_out = conv(mf_out, q_mmse);
-
-
+    MF_freq = fft(mf_out, N);
+    mmse_out = ifft(MF_freq .* Q_mmse);
 end
 
 function [arr_3d, image_max, image_min, image_size] = preProcess(imageName)
@@ -493,7 +508,10 @@ function [arr_3d, image_max, image_min, image_size] = preProcess(imageName)
     scaled_arr = (image_dct - image_min) / (image_max - image_min);
 
     image_size = size(scaled_arr);
-    arr_3d = reshape(scaled_arr, [8 8 (m*n)/64]);
+    % arr_3d = reshape(scaled_arr, [8 8 (m*n)/64]);
+    B = reshape(scaled_arr, [8, size(scaled_arr, 1)/8, 8, size(scaled_arr, 2)/8]);
+    B = permute(B, [1, 3, 2, 4]);
+    arr_3d = reshape(B, [8, 8, (m*n)/64]);
 end
 
 function bit_stream = bitStreamConvert(arr_3d, N)
